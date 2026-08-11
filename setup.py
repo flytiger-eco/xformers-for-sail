@@ -30,6 +30,11 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
 )
 
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:
+    _bdist_wheel = None
+
 
 this_dir = os.path.dirname(__file__)
 USE_PPU = "PPU_SDK" in os.environ.keys()
@@ -633,11 +638,38 @@ class clean(distutils.command.clean.clean):  # type: ignore
         distutils.command.clean.clean.run(self)
 
 
+class bdist_wheel_abi_none(_bdist_wheel if _bdist_wheel else object):
+    """
+    Custom wheel builder that tags wheels as ABI-independent despite containing compiled code.
+    The compiled extensions are plain shared libraries (.so/.dll) that use only PyTorch's
+    TORCH_LIBRARY mechanism, with no Python C API dependencies. This allows the same wheel
+    to work across different Python versions and variants (including free-threaded builds).
+    """
+
+    def get_tag(self):
+        if _bdist_wheel is None:
+            raise RuntimeError("wheel package is required to build wheels")
+
+        # Get the default tags from parent class
+        python_tag, abi_tag, plat_tag = super().get_tag()
+
+        # Override ABI tag to 'none' since our .so files have no Python ABI dependency
+        # Use 'py37' as python tag to indicate minimum Python version (3.7+)
+        # Keep platform tag since we have platform-specific compiled code
+        return "py37", "none", plat_tag
+
+
 class BuildExtensionWithExtraFiles(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         self.xformers_build_metadata = kwargs.pop("extra_files")
         self.pkg_name = "xformers"
         super().__init__(*args, **kwargs)
+
+    def get_export_symbols(self, ext):
+        # Don't export PyInit_* symbols since our extension doesn't use the
+        # Python C API. It registers operators with PyTorch via
+        # TORCH_LIBRARY_FRAGMENT and is loaded via torch.ops.load_library().
+        return []
 
     def build_extensions(self) -> None:
         super().build_extensions()
@@ -660,6 +692,22 @@ class BuildExtensionWithExtraFiles(BuildExtension):
             regular_file = os.path.join(self.build_lib, self.pkg_name, filename)
             self.copy_file(regular_file, inplace_file, level=self.verbose)
         super().copy_extensions_to_source()
+
+    def get_ext_filename(self, ext_name):
+        # Return plain .so/.pyd names without Python version tags
+        # This creates ABI-independent binaries that work with any Python version
+        ext_path = ext_name.split(".")
+        ext_basename = ext_path[-1]
+        ext_dir = os.path.join(*ext_path[:-1]) if len(ext_path) > 1 else ""
+
+        if sys.platform == "win32":
+            # Windows: use .pyd extension (required for importlib to find it)
+            filename = f"{ext_basename}.pyd"
+        else:
+            # Linux/Mac: use plain .so extension
+            filename = f"{ext_basename}.so"
+
+        return os.path.join(ext_dir, filename) if ext_dir else filename
 
 
 if __name__ == "__main__":
@@ -701,6 +749,7 @@ if __name__ == "__main__":
                     "version.py": generate_version_py(version),
                 },
             ),
+            "bdist_wheel": bdist_wheel_abi_none,
             "clean": clean,
         },
         url="https://facebookresearch.github.io/xformers/",
