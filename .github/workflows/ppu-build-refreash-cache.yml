@@ -1,5 +1,4 @@
 name: ppu-build-refresh-cache
-
 on:
   workflow_dispatch:
     inputs:
