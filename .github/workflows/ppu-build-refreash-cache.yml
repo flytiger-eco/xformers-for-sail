@@ -142,6 +142,7 @@ jobs:
           echo "pt-commit=${PT_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "[baseline] xformers=${XF_COMMIT} pytorch=${PT_COMMIT}"
 
+      - name: Compute cache metadata
         id: cache-meta
         env:
           CACHE_BRANCH: ${{ github.ref_name }}
