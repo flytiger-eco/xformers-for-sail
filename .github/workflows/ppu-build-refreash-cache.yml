@@ -1,0 +1,408 @@
+name: ppu-build-refresh-cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytorch-ref:
+        description: 要编译的 pytorch-for-sail 分支 / ref（默认 v2.11.0-for-ci）
+        type: string
+        default: v2.11.0
+      ccache-maxsize:
+        description: ccache 容量上限
+        type: string
+        default: "2G"
+      upload-wheel:
+        description: 上传编译出的 torch whl artifact
+        type: boolean
+        default: true
+  push:
+    branches:
+      - v0.0.27_for_pytorch
+    paths:
+      - '.github/workflows/ppu-build-refreash-cache.yml'
+      - 'xformers/csrc/**'
+      - 'third_party/**'
+      - 'setup.py'
+      - 'CMakeLists.txt'
+      - 'requirements.txt'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build xformers into torch (${{ matrix.board }})
+    strategy:
+      # 保留矩阵结构：目前只编 810，将来要加 890 只需往数组里加一项
+      fail-fast: false
+      matrix:
+        board: ["810"]
+    runs-on: x86-ubuntu2404-8-32
+    timeout-minutes: 400
+    env:
+      BUILD_ENVIRONMENT: ppu-linux-ubuntu24.04-py3.12-${{ matrix.board }}
+      DOCKER_IMAGE: pkg.flytiger-eco.com/docker_release/ppu:v2.1.1-cuda13.0-ubuntu24-py312
+      TORCH_CUDA_ARCH_LIST: "8.0"
+      MAX_JOBS: "8"
+      PPU_MEM_PER_JOB_GB: "4"
+      PPU_LINK_JOBS: "2"
+      CCACHE_MAXSIZE: ${{ inputs.ccache-maxsize || '2G' }}
+      SDK_INSTALL_DIR: /usr/local
+      PIP_INDEX_URL: ""
+      BUILD_ADDITIONAL_PACKAGES: ""
+      REPO_DIR_IN_CONTAINER: /pytorch
+      PYTORCH_REF: ${{ inputs.pytorch-ref || 'v2.11.0-for-ci' }}
+
+    steps:
+      - name: Show runner spec
+        run: |
+          echo "[spec] runner-name=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+          echo "[spec] nproc=$(nproc) mem=$(free -g | awk '/^Mem:/{print $2}')GB"
+          echo "[spec] event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} pytorch-ref=${PYTORCH_REF}"
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Checkout xformers (current PR)
+        id: checkout-xf
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: xformers-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 重试前等待 (xformers checkout)
+        if: steps.checkout-xf.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout xformers (current PR) (重试)
+        if: steps.checkout-xf.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          path: xformers-src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Checkout pytorch-for-sail
+        id: checkout-pt
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          path: pytorch
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 重试前等待 (pytorch checkout)
+        if: steps.checkout-pt.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout pytorch-for-sail (重试)
+        if: steps.checkout-pt.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          path: pytorch
+          submodules: recursive
+          fetch-depth: 1
+      - name: Swap in current PR's xformers
+        run: |
+          set -euo pipefail
+          DEST="${GITHUB_WORKSPACE}/pytorch/third_party/xformers"
+          SRC="${GITHUB_WORKSPACE}/xformers-src"
+
+          echo "[swap] 删除 pytorch 自带的 third_party/xformers"
+          rm -rf "${DEST}"
+          mkdir -p "${DEST}"
+
+          echo "[swap] 拷入当前 PR 的 xformers 源码（排除 .git 元数据）"
+          rsync -a --exclude '.git' "${SRC}/" "${DEST}/"
+
+          echo "[swap] 校验关键路径存在"
+          test -d "${DEST}/xformers/csrc" || { echo "::error::替换后缺少 xformers/csrc"; exit 1; }
+          test -d "${DEST}/third_party/cutlass" || echo "::warning::xformers/third_party/cutlass 为空，若编译需要请检查子模块检出"
+          echo "[swap] 完成，替换后目录概览："
+          ls -la "${DEST}" | head -20
+
+      - name: Record baseline commits
+        id: baseline
+        run: |
+          XF_COMMIT=$(git -C "${GITHUB_WORKSPACE}/xformers-src" rev-parse --short=7 HEAD)
+          PT_COMMIT=$(git -C "${GITHUB_WORKSPACE}/pytorch" rev-parse --short=7 HEAD)
+          echo "xf-commit=${XF_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "pt-commit=${PT_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "[baseline] xformers=${XF_COMMIT} pytorch=${PT_COMMIT}"
+
+        id: cache-meta
+        env:
+          CACHE_BRANCH: ${{ github.ref_name }}
+        run: |
+          branch_slug=$(printf '%s' "${CACHE_BRANCH}" | tr -c '[:alnum:]._-' '-')
+          fingerprint=$(
+            printf '%s\n%s\n' "${DOCKER_IMAGE}" "${TORCH_CUDA_ARCH_LIST}" | sha256sum | cut -c1-12
+          )
+          prefix="ppu-ccache-${BUILD_ENVIRONMENT}-${branch_slug}-${fingerprint}-"
+          echo "restore-prefix=${prefix}" >> "$GITHUB_OUTPUT"
+          echo "key=${prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "[cache] branch=${CACHE_BRANCH} prefix=${prefix}"
+
+      - name: Free disk space
+        run: |
+          avail_gb=$(df -Pk / | awk 'NR==2 {print int($4 / 1024 / 1024)}')
+          echo "[disk] 根分区可用 ${avail_gb}GB"
+          if [[ "${avail_gb}" -ge 150 ]]; then
+            echo "[disk] 空间充足，跳过清理"
+            exit 0
+          fi
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/powershell /usr/share/swift \
+                      /usr/share/miniconda /usr/local/lib/node_modules \
+                      /usr/local/share/chromium /usr/local/share/boost \
+                      /usr/lib/google-cloud-sdk /usr/lib/jvm /opt/hostedtoolcache || true
+          $SUDO apt-get clean || true
+          $SUDO docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Report ccache state
+        run: |
+          echo "[cache] 本流水线只写不读：不 restore 旧缓存，本轮冷编译，编完把产出写成新基线"
+
+      - name: Add swap
+        continue-on-error: true
+        run: |
+          if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+            echo "[swap] 已有 swap，跳过"; swapon --show; exit 0
+          fi
+          swap_file=/mnt/ppu-swapfile
+          [[ -d /mnt ]] || swap_file=/ppu-swapfile
+          sudo fallocate -l 16G "${swap_file}" \
+            || sudo dd if=/dev/zero of="${swap_file}" bs=1M count=16384 status=none
+          sudo chmod 600 "${swap_file}"
+          sudo mkswap "${swap_file}" >/dev/null
+          sudo swapon "${swap_file}"
+          sudo sysctl -w vm.swappiness=10 >/dev/null
+          free -h
+
+      - name: Pull docker image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull "${DOCKER_IMAGE}"; then
+              exit 0
+            fi
+            echo "[pull] 第 ${attempt} 次失败，60s 后重试" >&2
+            sleep 60
+          done
+          echo "::error::无法拉取 ${DOCKER_IMAGE}"
+          exit 1
+
+      - name: Start build container
+        id: container
+        env:
+          SOURCE_COMMIT: ${{ steps.baseline.outputs.pt-commit }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/ppu-ccache"
+          container_name=$(docker run \
+            --detach --tty --entrypoint /bin/bash \
+            -e REPO_DIR="${REPO_DIR_IN_CONTAINER}" \
+            -e BUILD_ENVIRONMENT \
+            -e TORCH_CUDA_ARCH_LIST \
+            -e MAX_JOBS \
+            -e SDK_INSTALL_DIR \
+            -e PIP_INDEX_URL \
+            -e BUILD_ADDITIONAL_PACKAGES \
+            -e PPU_MEM_PER_JOB_GB \
+            -e PPU_LINK_JOBS \
+            -e CCACHE_DIR=/root/.cache/ccache \
+            -e CCACHE_MAXSIZE \
+            --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE \
+            -v "${GITHUB_WORKSPACE}/pytorch:${REPO_DIR_IN_CONTAINER}" \
+            -v "${RUNNER_TEMP}/ppu-ccache:/root/.cache/ccache" \
+            -w "${REPO_DIR_IN_CONTAINER}" \
+            "${DOCKER_IMAGE}" \
+            -c 'sleep 12h'
+          )
+          echo "container-name=${container_name}" >> "$GITHUB_OUTPUT"
+
+          # 挂载进来的源码属主与容器内用户不一致，放开 git safe.directory
+          docker exec -t "${container_name}" bash -c \
+            "git config --global --add safe.directory ${REPO_DIR_IN_CONTAINER} \
+             && git config --global --add safe.directory '*'"
+          # build_wheel.sh 优先读该文件作为 stamp 键
+          docker exec -t "${container_name}" bash -c \
+            "echo '${SOURCE_COMMIT}' > /tmp/ppu_source_commit"
+
+      - name: Check PPU SDK in image
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/sdk_env.sh
+
+      - name: Setup ccache in container
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/ccache_env.sh
+          docker exec -t "${CONTAINER_NAME}" ccache -z \
+            || echo "[ccache] 归零统计失败，不影响编译" >&2
+
+      - name: Build PPU torch wheel (with swapped xformers)
+        id: build
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          mem_log="${RUNNER_TEMP}/mem-samples.log"
+          ( while true; do
+              printf '%s %s\n' "$(date -u +%H:%M:%S)" \
+                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB ", $3, $7} /^Swap:/{printf "swap=%sMB", $3}')" \
+                >> "${mem_log}"
+              sleep 30
+            done ) &
+          sampler_pid=$!
+          # shellcheck disable=SC2064
+          trap "kill ${sampler_pid} 2>/dev/null || true" EXIT
+
+          set +e
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/build_wheel.sh
+          rc=$?
+          set -e
+          if [[ "${rc}" -ne 0 ]]; then
+            if [[ "${rc}" -eq 137 ]]; then
+              echo "::error::编译进程被 SIGKILL（exit 137），几乎必然是宿主机 OOM"
+              echo "[oom] MAX_JOBS=${MAX_JOBS} PPU_LINK_JOBS=${PPU_LINK_JOBS}，继续发生时先下调" >&2
+              tail -10 "${mem_log}" 2>/dev/null || true
+            fi
+            exit "${rc}"
+          fi
+
+      - name: Dump OOM diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          echo "=== dmesg OOM ==="
+          sudo dmesg -T 2>/dev/null | grep -iE "out of memory|killed process|oom-kill" | tail -30 \
+            || echo "（无 dmesg 权限或未记录到 OOM）"
+          free -h; df -h /
+          tail -40 "${RUNNER_TEMP}/mem-samples.log" 2>/dev/null || echo "（无采样数据）"
+
+      - name: Report ccache stats
+        if: always() && steps.container.outputs.container-name != ''
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec "${CONTAINER_NAME}" ccache -c >/dev/null 2>&1 || true
+          stats=$(docker exec "${CONTAINER_NAME}" ccache -s 2>/dev/null || true)
+          [[ -z "${stats}" ]] && { echo "[ccache] 无统计输出"; exit 0; }
+          echo "${stats}"
+          {
+            echo "<details><summary>ccache stats</summary>"
+            echo ""; echo '```'; printf '%s\n' "${stats}"; echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect wheel
+        id: collect
+        env:
+          XF_COMMIT: ${{ steps.baseline.outputs.xf-commit }}
+          PT_COMMIT: ${{ steps.baseline.outputs.pt-commit }}
+        run: |
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO chown -R "$(id -u):$(id -g)" pytorch/dist 2>/dev/null || true
+
+          shopt -s nullglob
+          whls=(pytorch/dist/torch-*.whl)
+          if [[ ${#whls[@]} -eq 0 ]]; then
+            echo "::error::pytorch/dist 下没有 torch-*.whl"
+            ls -la pytorch/dist 2>/dev/null || echo "pytorch/dist 不存在"
+            exit 1
+          fi
+          wheel_name=$(basename "${whls[0]}")
+          env_slug=$(printf '%s' "${BUILD_ENVIRONMENT}" | tr -c '[:alnum:]._-' '-')
+          echo "wheel-name=${wheel_name}" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=ppu-torch-xf-${env_slug}-xf${XF_COMMIT}-pt${PT_COMMIT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### PPU torch build（已换入当前 PR 的 xformers）"
+            echo ""
+            echo "- 镜像: \`${DOCKER_IMAGE}\`"
+            echo "- 架构: \`${TORCH_CUDA_ARCH_LIST}\`（board ${{ matrix.board }}）"
+            echo "- xformers commit: \`${XF_COMMIT}\`"
+            echo "- pytorch-for-sail: \`${PYTORCH_REF}\` @ \`${PT_COMMIT}\`"
+            echo "- whl: \`${wheel_name}\` ($(du -h "${whls[0]}" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wheel artifact
+        if: ${{ inputs.upload-wheel || github.event_name == 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.artifact-name }}
+          path: pytorch/dist/torch-*.whl
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Prepare ccache for upload
+        if: ${{ success() }}
+        run: |
+          # 容器以 root 写缓存目录，runner 用户需可读才能打包上传
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/ppu-ccache" 2>/dev/null || true
+          echo "[cache] 待上传 ccache 大小 $(du -sh "${RUNNER_TEMP}/ppu-ccache" | cut -f1)"
+
+      - name: Prune old ccache entries
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ steps.cache-meta.outputs.restore-prefix }}
+        run: |
+          ids=$(gh cache list --repo "${GITHUB_REPOSITORY}" --key "${PREFIX}" \
+                  --limit 100 --json id --jq '.[].id' 2>/dev/null || true)
+          if [[ -z "${ids}" ]]; then
+            echo "[cache] 无同前缀旧条目（首次种缓存属正常；列出需 actions:read 权限）"
+            exit 0
+          fi
+          for id in ${ids}; do
+            echo "[cache] 删除旧条目 id=${id}"
+            gh cache delete "${id}" --repo "${GITHUB_REPOSITORY}" || true
+          done
+
+      - name: Save ccache
+        if: ${{ success() }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ppu-ccache
+          key: ${{ steps.cache-meta.outputs.key }}
+
+      - name: Report repo cache usage
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 稳态应是「每分支 × 每板型恰好一份基线」（prune 保证）
+          echo "=== 当前仓库 ppu-ccache-* 条目 ==="
+          gh cache list --repo "${GITHUB_REPOSITORY}" --key "ppu-ccache-" \
+            --limit 50 2>/dev/null || echo "（需 actions:read 权限才能列出）"
+
+      - name: Teardown container
+        if: always() && steps.container.outputs.container-name != ''
+        continue-on-error: true
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker rm -f "${CONTAINER_NAME}" || true
+          df -h /
