@@ -1,0 +1,555 @@
+name: ppu-linux-810-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytorch-ref:
+        description: 提供 test/test_transformers.py 与 .ci/ppu 脚本的 pytorch-for-sail 分支 / ref（默认 v2.11.0-for-ci）
+        type: string
+        default: v2.11.0-for-ci
+      ccache-maxsize:
+        description: ccache 容量上限
+        type: string
+        default: "2G"
+  pull_request:
+    branches:
+      - xformers-for-ci
+      - v0.0.27_for_pytorch
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - 'xformers/csrc/**'
+      - 'third_party/**'
+      - 'setup.py'
+      - 'CMakeLists.txt'
+      - 'requirements.txt'
+  push:
+    branches:
+      - xformers-for-ci
+      - v0.0.27_for_pytorch
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - 'xformers/csrc/**'
+      - 'third_party/**'
+      - 'setup.py'
+      - 'CMakeLists.txt'
+      - 'requirements.txt'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  IMAGE: pkg.flytiger-eco.com/docker_release/ppu:v2.1.1-cuda13.0-ubuntu24-py312
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+  PIP_INDEX: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+  TRITON_VERSION: "3.6.0"
+  WHEEL_DIR_REL: .ci/ppu/wheelhouse
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build xformers into torch (${{ matrix.board }})
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ["810"]
+    runs-on: x86-ubuntu2404-8-32
+    timeout-minutes: 400
+    outputs:
+      artifact-name: ${{ steps.collect.outputs.artifact-name }}
+      wheel-name: ${{ steps.collect.outputs.wheel-name }}
+    env:
+      BUILD_ENVIRONMENT: ppu-linux-ubuntu24.04-py3.12-${{ matrix.board }}
+      DOCKER_IMAGE: pkg.flytiger-eco.com/docker_release/ppu:v2.1.1-cuda13.0-ubuntu24-py312
+      TORCH_CUDA_ARCH_LIST: "8.0"
+      MAX_JOBS: "8"
+      PPU_MEM_PER_JOB_GB: "4"
+      PPU_LINK_JOBS: "2"
+      CCACHE_MAXSIZE: ${{ inputs.ccache-maxsize || '2G' }}
+      SDK_INSTALL_DIR: /usr/local
+      PIP_INDEX_URL: ""
+      BUILD_ADDITIONAL_PACKAGES: ""
+      REPO_DIR_IN_CONTAINER: /pytorch
+      PYTORCH_REF: ${{ inputs.pytorch-ref || 'v2.11.0-for-ci' }}
+
+    steps:
+      - name: Show runner spec
+        run: |
+          echo "[spec] runner-name=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+          echo "[spec] nproc=$(nproc) mem=$(free -g | awk '/^Mem:/{print $2}')GB"
+          echo "[spec] event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} pytorch-ref=${PYTORCH_REF}"
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Checkout xformers (current PR)
+        id: checkout-xf
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: xformers-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 重试前等待 (xformers checkout)
+        if: steps.checkout-xf.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout xformers (current PR) (重试)
+        if: steps.checkout-xf.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          path: xformers-src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Checkout pytorch-for-sail
+        id: checkout-pt
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          path: pytorch
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 重试前等待 (pytorch checkout)
+        if: steps.checkout-pt.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout pytorch-for-sail (重试)
+        if: steps.checkout-pt.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          path: pytorch
+          submodules: recursive
+          fetch-depth: 1
+      - name: Swap in current PR's xformers
+        run: |
+          set -euo pipefail
+          DEST="${GITHUB_WORKSPACE}/pytorch/third_party/xformers"
+          SRC="${GITHUB_WORKSPACE}/xformers-src"
+
+          echo "[swap] 删除 pytorch 自带的 third_party/xformers"
+          rm -rf "${DEST}"
+          mkdir -p "${DEST}"
+
+          echo "[swap] 拷入当前 PR 的 xformers 源码（排除 .git 元数据）"
+          rsync -a --exclude '.git' "${SRC}/" "${DEST}/"
+
+          echo "[swap] 校验关键路径存在"
+          test -d "${DEST}/xformers/csrc" || { echo "::error::替换后缺少 xformers/csrc"; exit 1; }
+          test -d "${DEST}/third_party/cutlass" || echo "::warning::xformers/third_party/cutlass 为空，若编译需要请检查子模块检出"
+          echo "[swap] 完成，替换后目录概览："
+          ls -la "${DEST}" | head -20
+
+      - name: Record baseline commits
+        id: baseline
+        run: |
+          XF_COMMIT=$(git -C "${GITHUB_WORKSPACE}/xformers-src" rev-parse --short=7 HEAD)
+          PT_COMMIT=$(git -C "${GITHUB_WORKSPACE}/pytorch" rev-parse --short=7 HEAD)
+          echo "xf-commit=${XF_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "pt-commit=${PT_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "[baseline] xformers=${XF_COMMIT} pytorch=${PT_COMMIT}"
+
+      - name: Compute cache metadata
+        id: cache-meta
+        env:
+          CACHE_BRANCH: ${{ github.ref_name }}
+        run: |
+          branch_slug=$(printf '%s' "${CACHE_BRANCH}" | tr -c '[:alnum:]._-' '-')
+          fingerprint=$(
+            printf '%s\n%s\n' "${DOCKER_IMAGE}" "${TORCH_CUDA_ARCH_LIST}" | sha256sum | cut -c1-12
+          )
+          # 与 ppu-build-refresh-cache.yml 的种缓存前缀严格对齐，才能命中写入方种下的基线
+          prefix="ppu-ccache-${BUILD_ENVIRONMENT}-${branch_slug}-${fingerprint}-"
+          echo "restore-prefix=${prefix}" >> "$GITHUB_OUTPUT"
+          # 兜底前缀：本分支还没被 refresh-cache 种过基线时，回退到同板型任意分支的最新基线
+          echo "fallback-prefix=ppu-ccache-${BUILD_ENVIRONMENT}-" >> "$GITHUB_OUTPUT"
+          echo "[cache] branch=${CACHE_BRANCH} restore-prefix=${prefix}"
+
+      - name: Free disk space
+        run: |
+          avail_gb=$(df -Pk / | awk 'NR==2 {print int($4 / 1024 / 1024)}')
+          echo "[disk] 根分区可用 ${avail_gb}GB"
+          if [[ "${avail_gb}" -ge 150 ]]; then
+            echo "[disk] 空间充足，跳过清理"
+            exit 0
+          fi
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/powershell /usr/share/swift \
+                      /usr/share/miniconda /usr/local/lib/node_modules \
+                      /usr/local/share/chromium /usr/local/share/boost \
+                      /usr/lib/google-cloud-sdk /usr/lib/jvm /opt/hostedtoolcache || true
+          $SUDO apt-get clean || true
+          $SUDO docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Restore ccache baseline
+        id: restore-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ppu-ccache
+          key: ${{ steps.cache-meta.outputs.restore-prefix }}
+          restore-keys: |
+            ${{ steps.cache-meta.outputs.restore-prefix }}
+            ${{ steps.cache-meta.outputs.fallback-prefix }}
+
+      - name: Report ccache state
+        run: |
+          if [[ -n "${{ steps.restore-ccache.outputs.cache-matched-key }}" ]]; then
+            echo "[cache] 命中基线 key=${{ steps.restore-ccache.outputs.cache-matched-key }}，本轮走增量编译"
+          else
+            echo "[cache] 未命中任何基线（本分支尚未被 refresh-cache 种过？），本轮冷编译"
+          fi
+
+      - name: Add swap
+        continue-on-error: true
+        run: |
+          if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+            echo "[swap] 已有 swap，跳过"; swapon --show; exit 0
+          fi
+          swap_file=/mnt/ppu-swapfile
+          [[ -d /mnt ]] || swap_file=/ppu-swapfile
+          sudo fallocate -l 16G "${swap_file}" \
+            || sudo dd if=/dev/zero of="${swap_file}" bs=1M count=16384 status=none
+          sudo chmod 600 "${swap_file}"
+          sudo mkswap "${swap_file}" >/dev/null
+          sudo swapon "${swap_file}"
+          sudo sysctl -w vm.swappiness=10 >/dev/null
+          free -h
+
+      - name: Pull docker image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull "${DOCKER_IMAGE}"; then
+              exit 0
+            fi
+            echo "[pull] 第 ${attempt} 次失败，60s 后重试" >&2
+            sleep 60
+          done
+          echo "::error::无法拉取 ${DOCKER_IMAGE}"
+          exit 1
+
+      - name: Start build container
+        id: container
+        env:
+          SOURCE_COMMIT: ${{ steps.baseline.outputs.pt-commit }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/ppu-ccache"
+          container_name=$(docker run \
+            --detach --tty --entrypoint /bin/bash \
+            -e REPO_DIR="${REPO_DIR_IN_CONTAINER}" \
+            -e BUILD_ENVIRONMENT \
+            -e TORCH_CUDA_ARCH_LIST \
+            -e MAX_JOBS \
+            -e SDK_INSTALL_DIR \
+            -e PIP_INDEX_URL \
+            -e BUILD_ADDITIONAL_PACKAGES \
+            -e PPU_MEM_PER_JOB_GB \
+            -e PPU_LINK_JOBS \
+            -e CCACHE_DIR=/root/.cache/ccache \
+            -e CCACHE_MAXSIZE \
+            --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE \
+            -v "${GITHUB_WORKSPACE}/pytorch:${REPO_DIR_IN_CONTAINER}" \
+            -v "${RUNNER_TEMP}/ppu-ccache:/root/.cache/ccache" \
+            -w "${REPO_DIR_IN_CONTAINER}" \
+            "${DOCKER_IMAGE}" \
+            -c 'sleep 12h'
+          )
+          echo "container-name=${container_name}" >> "$GITHUB_OUTPUT"
+
+          # 挂载进来的源码属主与容器内用户不一致，放开 git safe.directory
+          docker exec -t "${container_name}" bash -c \
+            "git config --global --add safe.directory ${REPO_DIR_IN_CONTAINER} \
+             && git config --global --add safe.directory '*'"
+          # build_wheel.sh 优先读该文件作为 stamp 键
+          docker exec -t "${container_name}" bash -c \
+            "echo '${SOURCE_COMMIT}' > /tmp/ppu_source_commit"
+
+      - name: Check PPU SDK in image
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/sdk_env.sh
+
+      - name: Setup ccache in container
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/ccache_env.sh
+          docker exec -t "${CONTAINER_NAME}" ccache -z \
+            || echo "[ccache] 归零统计失败，不影响编译" >&2
+
+      - name: Build PPU torch wheel (with swapped xformers)
+        id: build
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          mem_log="${RUNNER_TEMP}/mem-samples.log"
+          ( while true; do
+              printf '%s %s\n' "$(date -u +%H:%M:%S)" \
+                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB ", $3, $7} /^Swap:/{printf "swap=%sMB", $3}')" \
+                >> "${mem_log}"
+              sleep 30
+            done ) &
+          sampler_pid=$!
+          # shellcheck disable=SC2064
+          trap "kill ${sampler_pid} 2>/dev/null || true" EXIT
+
+          set +e
+          docker exec -t "${CONTAINER_NAME}" bash .ci/ppu/build_wheel.sh
+          rc=$?
+          set -e
+          if [[ "${rc}" -ne 0 ]]; then
+            if [[ "${rc}" -eq 137 ]]; then
+              echo "::error::编译进程被 SIGKILL（exit 137），几乎必然是宿主机 OOM"
+              echo "[oom] MAX_JOBS=${MAX_JOBS} PPU_LINK_JOBS=${PPU_LINK_JOBS}，继续发生时先下调" >&2
+              tail -10 "${mem_log}" 2>/dev/null || true
+            fi
+            exit "${rc}"
+          fi
+
+      - name: Dump OOM diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          echo "=== dmesg OOM ==="
+          sudo dmesg -T 2>/dev/null | grep -iE "out of memory|killed process|oom-kill" | tail -30 \
+            || echo "（无 dmesg 权限或未记录到 OOM）"
+          free -h; df -h /
+          tail -40 "${RUNNER_TEMP}/mem-samples.log" 2>/dev/null || echo "（无采样数据）"
+
+      - name: Report ccache stats
+        if: always() && steps.container.outputs.container-name != ''
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker exec "${CONTAINER_NAME}" ccache -c >/dev/null 2>&1 || true
+          stats=$(docker exec "${CONTAINER_NAME}" ccache -s 2>/dev/null || true)
+          [[ -z "${stats}" ]] && { echo "[ccache] 无统计输出"; exit 0; }
+          echo "${stats}"
+          {
+            echo "<details><summary>ccache stats</summary>"
+            echo ""; echo '```'; printf '%s\n' "${stats}"; echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect wheel
+        id: collect
+        env:
+          XF_COMMIT: ${{ steps.baseline.outputs.xf-commit }}
+          PT_COMMIT: ${{ steps.baseline.outputs.pt-commit }}
+        run: |
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO chown -R "$(id -u):$(id -g)" pytorch/dist 2>/dev/null || true
+
+          shopt -s nullglob
+          whls=(pytorch/dist/torch-*.whl)
+          if [[ ${#whls[@]} -eq 0 ]]; then
+            echo "::error::pytorch/dist 下没有 torch-*.whl"
+            ls -la pytorch/dist 2>/dev/null || echo "pytorch/dist 不存在"
+            exit 1
+          fi
+          wheel_name=$(basename "${whls[0]}")
+          env_slug=$(printf '%s' "${BUILD_ENVIRONMENT}" | tr -c '[:alnum:]._-' '-')
+          echo "wheel-name=${wheel_name}" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=ppu-torch-xf-${env_slug}-xf${XF_COMMIT}-pt${PT_COMMIT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### PPU torch build（已换入当前 PR 的 xformers）"
+            echo ""
+            echo "- 镜像: \`${DOCKER_IMAGE}\`"
+            echo "- 架构: \`${TORCH_CUDA_ARCH_LIST}\`（board ${{ matrix.board }}）"
+            echo "- xformers commit: \`${XF_COMMIT}\`"
+            echo "- pytorch-for-sail: \`${PYTORCH_REF}\` @ \`${PT_COMMIT}\`"
+            echo "- whl: \`${wheel_name}\` ($(du -h "${whls[0]}" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.artifact-name }}
+          path: pytorch/dist/torch-*.whl
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Teardown container
+        if: always() && steps.container.outputs.container-name != ''
+        continue-on-error: true
+        env:
+          CONTAINER_NAME: ${{ steps.container.outputs.container-name }}
+        run: |
+          docker rm -f "${CONTAINER_NAME}" || true
+          df -h /
+
+  test:
+    name: ppu-test-transformers (810E 单卡)
+    needs: build
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 180
+    env:
+      PYTORCH_REF: ${{ inputs.pytorch-ref || 'v2.11.0-for-ci' }}
+
+    steps:
+      - name: Checkout pytorch-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          fetch-depth: 1
+
+      - name: 重试前等待 (checkout 1)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout pytorch-for-sail (重试 1)
+        id: checkout-retry-1
+        if: steps.checkout.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          fetch-depth: 1
+
+      - name: 重试前等待 (checkout 2)
+        if: steps.checkout.outcome == 'failure' && steps.checkout-retry-1.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout pytorch-for-sail (重试 2)
+        if: steps.checkout.outcome == 'failure' && steps.checkout-retry-1.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: flytiger-eco/pytorch-for-sail
+          ref: ${{ env.PYTORCH_REF }}
+          fetch-depth: 1
+
+      - name: 下载 whl artifact
+        id: download-wheel
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ env.WHEEL_DIR_REL }}
+
+      - name: 重试前清场 (1)
+        if: steps.download-wheel.outcome == 'failure'
+        env:
+          WHEEL_DIR: ${{ env.WHEEL_DIR_REL }}
+        run: |
+          # v4 是边下边解压的，中途断掉可能留下一个截断的 whl；不清掉的话重试后
+          # 「校验 whl」可能数到一个坏包，等到 pod 里 pip install 才炸（那时已占着 PPU 卡）。
+          rm -rf "${WHEEL_DIR}"
+          sleep 30
+
+      - name: 下载 whl artifact (重试 1)
+        id: download-wheel-retry-1
+        if: steps.download-wheel.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ env.WHEEL_DIR_REL }}
+
+      - name: 重试前清场 (2)
+        if: steps.download-wheel.outcome == 'failure' && steps.download-wheel-retry-1.outcome == 'failure'
+        env:
+          WHEEL_DIR: ${{ env.WHEEL_DIR_REL }}
+        run: |
+          rm -rf "${WHEEL_DIR}"
+          sleep 60
+
+      - name: 下载 whl artifact (重试 2)
+        if: steps.download-wheel.outcome == 'failure' && steps.download-wheel-retry-1.outcome == 'failure'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ env.WHEEL_DIR_REL }}
+
+      - name: 校验 whl 已就位
+        env:
+          WHEEL_DIR: ${{ env.WHEEL_DIR_REL }}
+          BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          count=0
+          wheel=""
+          for f in "${WHEEL_DIR}"/torch-*.whl; do
+            # glob 无匹配时 sh 会原样保留模式字符串，用 -e 过滤掉这个不存在的字面量（等价 nullglob）
+            [ -e "$f" ] || continue
+            count=$((count + 1))
+            wheel="$f"
+          done
+          if [ "$count" -ne 1 ]; then
+            echo "::error::期望 ${WHEEL_DIR} 下恰好 1 个 torch-*.whl，实际 ${count} 个"
+            ls -la "${WHEEL_DIR}" 2>/dev/null || echo "（目录不存在）"
+            exit 1
+          fi
+          wheel_name=$(basename "$wheel")
+          echo "[wheel] ${wheel_name} ($(du -h "$wheel" | cut -f1))"
+          {
+            echo "### 被测 whl"
+            echo ""
+            echo "- 包: \`${wheel_name}\`"
+            echo "- 来源: ${BUILD_RUN_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "810 run test cases"
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 120
+
+          command: |
+            bash <<'PPU_TRANSFORMERS_TEST'
+            set -uo pipefail
+            export SDK_INSTALL_DIR="/usr/local"
+            export WHEEL_DIR="${{ env.SOURCE_DIR }}/${{ env.WHEEL_DIR_REL }}"
+            export PIP_INDEX="${{ env.PIP_INDEX }}"
+            export TRITON_INDEX="${{ env.PIP_INDEX }}"
+            export TRITON_VERSION="${{ env.TRITON_VERSION }}"
+            cd "${{ env.SOURCE_DIR }}"
+
+            # 顺序对齐 accuracy_test.sh：先 source SDK 环境，再装被测 whl、triton、测试依赖
+            source .ci/ppu/sdk_env.sh
+            bash .ci/ppu/install_wheel.sh
+            bash .ci/ppu/install_triton.sh
+
+            echo "=== 环境自检 (CUDA) ==="
+            echo "hostname=$(hostname) node=${NODE_NAME:-unknown}"
+            python --version
+            (cd /tmp && python -c "import torch; print('torch', torch.__version__, torch.__file__); print('cuda_available', torch.cuda.is_available()); print('device_count', torch.cuda.device_count())")
+            ppu-smi || echo "[warn] ppu-smi 不可用，请确认 pod 已分配 PPU 设备"
+
+            bash .ci/ppu/install_test_deps.sh
+
+            echo "=== 810E 单卡 test/test_transformers.py（全量，不做任何过滤） ==="
+            python test/run_test.py \
+                --include test_transformers \
+                --verbose
+            echo "[transformers-test] 完成"
+            PPU_TRANSFORMERS_TEST
