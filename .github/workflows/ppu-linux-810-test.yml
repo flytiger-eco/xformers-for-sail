@@ -551,6 +551,5 @@ jobs:
             python test/run_test.py \
                 --include test_transformers \
                 --verbose
-
             echo "[transformers-test] 完成"
             PPU_TRANSFORMERS_TEST
