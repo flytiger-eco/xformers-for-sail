@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       pytorch-ref:
-        description: 要编译的 pytorch-for-sail 分支 / ref（默认 v2.11.0-for-ci）
+        description: 要编译的 pytorch-for-sail 分支 / ref（默认 v2.11.0）
         type: string
-        default: v2.11.0-for-ci
+        default: v2.11.0
       ccache-maxsize:
         description: ccache 容量上限
         type: string
@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 400
     env:
       BUILD_ENVIRONMENT: ppu-linux-ubuntu24.04-py3.12-${{ matrix.board }}
-      DOCKER_IMAGE: pkg.flytiger-eco.com/docker_release/ppu:v2.1.1-cuda13.0-ubuntu24-py312
+      DOCKER_IMAGE: pkg.flytiger-eco.com/docker_release/ppu:sdk2.2.0-cuda13.0-ubuntu24-py312-20261001
       TORCH_CUDA_ARCH_LIST: "8.0"
       MAX_JOBS: "8"
       PPU_MEM_PER_JOB_GB: "4"
@@ -61,7 +61,7 @@ jobs:
       PIP_INDEX_URL: ""
       BUILD_ADDITIONAL_PACKAGES: ""
       REPO_DIR_IN_CONTAINER: /pytorch
-      PYTORCH_REF: ${{ inputs.pytorch-ref || 'v2.11.0-for-ci' }}
+      PYTORCH_REF: ${{ inputs.pytorch-ref || 'v2.11.0' }}
 
     steps:
       - name: Show runner spec
